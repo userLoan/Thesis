@@ -9,6 +9,7 @@
 # 4) Updates cumulative wealth S_t = S_{t-1} * (data[t] · w_t)
 # 5) Computes Sharpe on tick2ret(CW) as mean/std (NOT annualized)
 # 6) Simple web UI using Streamlit (single-file app)
+# 7) NEW: Preset menus for common groups (incl. Vietnam presets like VN30 ETF & VN-Index)
 # -------------------------------------------------------------
 # Quickstart
 #   pip install streamlit yfinance pandas numpy matplotlib
@@ -21,6 +22,26 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 from datetime import date, timedelta
+
+# -------------------------------
+# Presets (Yahoo Finance based)
+# -------------------------------
+# NOTE: Some markets/tickers on Yahoo require suffixes (e.g., .HK, .L, .HM).
+# Vietnam examples below are commonly used, but availability can vary.
+# - E1VFVN30.HM: SSIAM VN30 ETF (tracks VN30)
+# - ^VNINDEX: Vietnam VN-Index (broad market)
+# If a symbol is unavailable in your region, you can edit/replace it in the input.
+
+YF_PRESETS: dict[str, list[str]] = {
+    "US Megacap Tech": ["AAPL", "MSFT", "AMZN", "NVDA", "META", "GOOGL"],
+    "US Broad ETFs": ["SPY", "QQQ", "IWM", "EFA", "EEM"],
+    "Europe Large (examples)": ["EZU", "VGK"],
+    "Hong Kong / China Tech": ["0700.HK", "3690.HK", "BABA", "9888.HK"],
+    # Vietnam
+    "Vietnam - VN30 ETF": ["E1VFVN30.HM"],
+    "Vietnam - Broad Index": ["^VNINDEX"],
+    # You can extend with your own curated baskets
+}
 
 # -------------------------------
 # Utils
@@ -130,15 +151,15 @@ def fetch_gross_returns(tickers: list[str], start: date, end: date) -> pd.DataFr
     Uses auto_adjust=True so 'Close' is adjusted; returns a DataFrame indexed by date
     with columns=tickers, entries are gross returns (1+r).
     """
-    # yfinance expects strings like 'AAPL MSFT'
-    tick_str = " ".join([t.strip().upper() for t in tickers if t.strip()])
+    tick_list = [t.strip() for t in tickers if t and t.strip()]
+    tick_str = " ".join([t.upper() for t in tick_list])
     if not tick_str:
         raise ValueError("Ticker list is empty.")
 
     raw = yf.download(
         tick_str,
         start=start,
-        end=end + timedelta(days=1),  # include end-date fully
+        end=end + timedelta(days=1),  # include full end-date
         auto_adjust=True,
         progress=False,
         group_by='column'
@@ -147,16 +168,24 @@ def fetch_gross_returns(tickers: list[str], start: date, end: date) -> pd.DataFr
     # Handle single vs multiple tickers
     if isinstance(raw.columns, pd.MultiIndex):
         px = raw['Close'].copy()
+        # Keep only requested columns if Yahoo returned a superset
+        cols_to_keep = [c for c in px.columns if c.upper() in {s.upper() for s in tick_list}]
+        px = px[cols_to_keep]
     else:
-        # Single ticker case: make it a DataFrame with 1 column named by ticker
+        # Single ticker case
         px = raw[['Close']].copy()
-        px.columns = [tickers[0].strip().upper()]
+        # When Yahoo normalizes names, use the original requested name
+        px.columns = [tick_list[0]]
 
-    # Clean
-    px = px.dropna(how='all')
+    # Drop columns that are completely NaN (unavailable tickers), warn in UI later
+    px = px.dropna(axis=1, how='all')
+
+    # If nothing left, raise
+    if px.shape[1] == 0:
+        raise ValueError("None of the provided tickers returned data. Please check symbols/suffixes.")
+
+    # Forward/backward fill gaps then compute returns
     px = px.ffill().bfill()
-
-    # Compute simple returns then gross
     rets = px.pct_change().dropna(how='any')
     gross = 1.0 + rets
 
@@ -227,192 +256,101 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("📊 mSSRM-PGA Portfolio Backtester")
-st.caption("Fetches data from Yahoo Finance, transforms to gross returns (1+r), runs mSSRM with PGA, and reports non-annualized Sharpe.")
+st.title("mSSRM-PGA Backtester (Yahoo Finance)")
+st.caption(
+    "This demo fetches data from Yahoo Finance, transforms to gross returns (1+r), runs mSSRM with PGA, and reports non-annualized Sharpe."
+)
 
 with st.sidebar:
-    st.header("⚙️ Parameters")
-    
-    st.subheader("📈 Stock Selection")
-    default_tickers = "AAPL, MSFT, AMZN, NVDA, META, GOOGL"
-    tickers_text = st.text_input("Tickers (comma-separated)", value=default_tickers)
-    tickers = [t.strip().upper() for t in tickers_text.split(',') if t.strip()]
+    st.header("Parameters")
 
-    st.subheader("📅 Date Range")
+    # Tickers input with session state so we can modify from presets
+    if "tickers_text" not in st.session_state:
+        st.session_state.tickers_text = "AAPL, MSFT, AMZN, NVDA, META, GOOGL"
+
+    # Preset chooser
+    st.subheader("Presets (Yahoo)")
+    preset_name = st.selectbox("Choose a preset (optional)", options=["<None>"] + list(YF_PRESETS.keys()), index=0)
+    if st.button("Add preset to tickers") and preset_name != "<None>":
+        current = [t.strip() for t in st.session_state.tickers_text.split(',') if t.strip()]
+        merged = list(dict.fromkeys(current + YF_PRESETS[preset_name]))  # unique, keep order
+        st.session_state.tickers_text = ", ".join(merged)
+
+    tickers_text = st.text_input("Tickers (comma-separated)", key="tickers_text")
+    tickers = [t.strip() for t in tickers_text.split(',') if t.strip()]
+
+    st.caption("Tip: Vietnam examples — VN30 ETF: E1VFVN30.HM; Broad index: ^VNINDEX. If a symbol fails, edit suffix.")
+
     today = date.today()
     start_date = st.date_input("Start date", value=today.replace(year=max(2005, today.year - 7)))
     end_date = st.date_input("End date", value=today)
 
-    st.subheader("🔧 Algorithm Parameters")
-    winsize = st.number_input("Rolling window (days)", min_value=5, max_value=2000, value=60, step=5,
-                              help="Historical window size for optimization")
-    m = st.number_input("Sparsity m (number of assets)", min_value=1, max_value=200, value=5, step=1,
-                       help="Maximum number of assets to hold")
-    warmup = st.number_input("Warmup periods (no trading)", min_value=1, max_value=100, value=5, step=1,
-                            help="Initial periods without trading")
+    winsize = st.number_input("Rolling window (days)", min_value=5, max_value=2000, value=60, step=5)
+    m = st.number_input("Sparsity m (number of assets)", min_value=1, max_value=200, value=5, step=1)
+    warmup = st.number_input("Warmup periods (no trading)", min_value=1, max_value=100, value=5, step=1)
 
-    with st.expander("Advanced Settings"):
-        eps = st.number_input("Ridge epsilon", min_value=1e-9, value=1e-3, format="%e",
-                             help="Regularization parameter")
-        tol = st.number_input("Tolerance (RE)", min_value=1e-9, value=1e-5, format="%e",
-                             help="Convergence tolerance")
-        iternum = st.number_input("Max iterations", min_value=100, max_value=200000, value=10000, step=100,
-                                 help="Maximum iterations for optimization")
+    eps = st.number_input("Ridge epsilon", min_value=1e-9, value=1e-3, format="%e")
+    tol = st.number_input("Tolerance (RE)", min_value=1e-9, value=1e-5, format="%e")
+    iternum = st.number_input("Max iterations", min_value=100, max_value=200000, value=10000, step=100)
 
-    st.markdown("---")
-    run_btn = st.button("🚀 Run Backtest", type="primary", use_container_width=True)
+    run_btn = st.button("Run Backtest", type="primary")
 
 # Main content
 if run_btn:
     try:
-        with st.spinner("Fetching data from Yahoo Finance..."):
+        with st.status("Fetching data from Yahoo Finance...", expanded=False):
             gross = fetch_gross_returns(tickers, start_date, end_date)
-            st.success(f"✅ Downloaded {len(gross)} trading days for {len(gross.columns)} stocks")
+            # Warn about missing tickers
+            returned_cols = set(map(str.upper, gross.columns))
+            requested_cols = set(map(str.upper, tickers))
+            missing = [t for t in tickers if t.upper() not in returned_cols]
+            if missing:
+                st.warning(f"No data returned for: {', '.join(missing)}. Please verify symbols/suffixes.")
 
-        if m > len(tickers):
-            st.warning(f"⚠️ m ({m}) > number of tickers ({len(tickers)}). Using m={len(tickers)} instead.")
-            m_eff = len(tickers)
+        if m > len(gross.columns):
+            st.warning(f"m ({m}) > number of available series ({len(gross.columns)}). Using m={len(gross.columns)} instead.")
+            m_eff = len(gross.columns)
         else:
             m_eff = int(m)
 
-        with st.spinner("Running mSSRM-PGA rolling backtest..."):
+        with st.status("Running mSSRM-PGA rolling backtest...", expanded=False):
             cw, weights, sharpe = run_backtest(
-                gross, winsize=winsize, m=m_eff, eps=float(eps), 
-                iternum=int(iternum), tol=float(tol), warmup=int(warmup)
+                gross, winsize=winsize, m=m_eff, eps=float(eps), iternum=int(iternum), tol=float(tol), warmup=int(warmup)
             )
 
-        # Display metrics
-        st.header("📊 Results")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        final_wealth = cw.iloc[-1]
-        total_return = (final_wealth - 1) * 100
-        annualized_sharpe = sharpe * np.sqrt(252) if not np.isnan(sharpe) else np.nan
-        
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Final Wealth", f"${final_wealth:.4f}")
+            st.metric("Non-annualized Sharpe", f"{sharpe:.4f}" if not np.isnan(sharpe) else "NaN")
         with col2:
-            st.metric("Total Return", f"{total_return:.2f}%")
+            st.metric("Final wealth (CW end)", f"{cw.iloc[-1]:.4f}")
         with col3:
-            st.metric("Sharpe Ratio", f"{sharpe:.4f}" if not np.isnan(sharpe) else "NaN")
-        with col4:
-            st.metric("Ann. Sharpe", f"{annualized_sharpe:.4f}" if not np.isnan(annualized_sharpe) else "NaN")
+            st.metric("Trading days", f"{len(cw):d}")
 
-        # Cumulative Wealth Chart
-        st.subheader("💰 Cumulative Wealth Over Time")
-        st.line_chart(cw, height=350)
+        st.subheader("Cumulative Wealth")
+        st.line_chart(cw, height=300)
 
-        # Weights visualization
-        st.subheader("⚖️ Portfolio Weights Over Time")
+        st.subheader("Weights over time (stacked area)")
         # Only plot from first non-zero weights row
         first_idx = weights.replace(0.0, np.nan).dropna(how='all').index.min()
         w_plot = weights.copy()
         if first_idx is not None:
             w_plot = w_plot.loc[first_idx:]
-        st.area_chart(w_plot, height=380)
+        st.area_chart(w_plot, height=360)
 
-        # Final portfolio composition
-        st.subheader("🎯 Final Portfolio Composition")
-        final_weights = weights.iloc[-1]
-        weight_df = pd.DataFrame({
-            'Ticker': final_weights.index,
-            'Weight': final_weights.values
-        }).sort_values('Weight', ascending=False)
-        weight_df = weight_df[weight_df['Weight'] > 0].reset_index(drop=True)
-        
-        if len(weight_df) > 0:
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.dataframe(
-                    weight_df.style.format({'Weight': '{:.2%}'}),
-                    hide_index=True,
-                    height=300
-                )
-            with col2:
-                st.bar_chart(weight_df.set_index('Ticker')['Weight'], height=300)
-        else:
-            st.info("No positions in final portfolio")
+        st.subheader("Sample of weights (last 10 rows)")
+        st.dataframe(weights.tail(10).style.format("{:.4f}"))
 
-        # Sample weights table
-        st.subheader("📋 Sample of Weights (Last 10 Trading Days)")
-        st.dataframe(weights.tail(10).style.format("{:.4f}"), height=300)
+        # Downloads
+        cw_csv = cw.to_frame(name='CW').to_csv().encode('utf-8')
+        st.download_button("Download CW (CSV)", data=cw_csv, file_name="cw.csv", mime="text/csv")
 
-        # Download section
-        st.subheader("💾 Download Results")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            cw_csv = cw.to_frame(name='CW').to_csv().encode('utf-8')
-            st.download_button(
-                "📥 Download Cumulative Wealth (CSV)", 
-                data=cw_csv, 
-                file_name="mssrm_cw.csv", 
-                mime="text/csv",
-                use_container_width=True
-            )
-        
-        with col2:
-            weights_csv = weights.to_csv().encode('utf-8')
-            st.download_button(
-                "📥 Download Weights (CSV)", 
-                data=weights_csv, 
-                file_name="mssrm_weights.csv", 
-                mime="text/csv",
-                use_container_width=True
-            )
+        weights_csv = weights.to_csv().encode('utf-8')
+        st.download_button("Download Weights (CSV)", data=weights_csv, file_name="weights.csv", mime="text/csv")
 
-        st.caption("⚠️ Note: This is a research demo, not investment advice.")
+        st.caption("Note: This is a research demo, not investment advice.")
 
     except Exception as e:
-        st.error(f"❌ Error: {e}")
-        import traceback
-        with st.expander("Show error details"):
-            st.code(traceback.format_exc())
+        st.error(f"Error: {e}")
         st.stop()
 else:
-    st.info("👈 Set your parameters in the sidebar, then click **Run Backtest** to start.")
-    
-    # Information section
-    st.markdown("---")
-    st.subheader("📖 About mSSRM-PGA Algorithm")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        **Algorithm Overview:**
-        
-        The mSSRM-PGA (modified Sparse Second-order Risk Minimization with Proximal Gradient Algorithm) 
-        optimizes portfolio allocation by:
-        
-        1. **Minimizing risk** using second-order statistics (covariance)
-        2. **Enforcing sparsity** - selecting only top `m` assets
-        3. **Using regularization** (ε) for numerical stability
-        4. **Proximal gradient descent** for efficient optimization
-        
-        **Key Features:**
-        - Non-negative weights (long-only portfolio)
-        - Sparse solutions (limited diversification)
-        - Rolling window rebalancing
-        - Mean-variance optimization framework
-        """)
-    
-    with col2:
-        st.markdown("""
-        **Parameters Guide:**
-        
-        - **Window Size**: Historical data length for each optimization
-          - Larger = more stable but slower to adapt
-          - Typical: 20-120 trading days
-        
-        - **Sparsity (m)**: Maximum number of assets to hold
-          - Smaller = more concentrated portfolio
-          - Larger = more diversification
-        
-        - **Epsilon (ε)**: Regularization strength
-          - Larger = more stable, less aggressive
-          - Smaller = follows data more closely
-        
-        - **Warmup**: Initial periods without trading
-          - Prevents trading with insufficient data
-        """)
+    st.info("Choose a preset or enter tickers, set parameters, then click **Run Backtest**.")
